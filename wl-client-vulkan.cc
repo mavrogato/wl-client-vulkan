@@ -4,12 +4,10 @@
 #include <memory>
 #include <tuple>
 #include <utility>
-#include <bitset>
-#include <limits>
-#include <coroutine>
 #include <initializer_list>
 #include <source_location>
 #include <complex>
+#include <vector>
 
 #include <cstdint>
 
@@ -87,7 +85,7 @@ int main() {
         void* compositor_raw = nullptr;
         void* seat_raw = nullptr;
         void* shell_raw = nullptr;
-        void* tablet_raw = nullptr;
+        void* tablet_manager_raw = nullptr;
 
         auto registry_binder = bind_listener<wl_registry_listener>(
             [&](uint32_t name, std::string_view interface, uint32_t version) noexcept { // global
@@ -110,7 +108,7 @@ int main() {
                                                  version);
                 }
                 else if (interface == zwp_tablet_manager_v2_interface.name) {
-                    tablet_raw = wl_registry_bind(registry.get(),
+                    tablet_manager_raw = wl_registry_bind(registry.get(),
                                                   name,
                                                   &zwp_tablet_manager_v2_interface,
                                                   version);
@@ -125,7 +123,8 @@ int main() {
         auto compositor = safe_ptr(reinterpret_cast<wl_compositor*>(compositor_raw), wl_compositor_destroy);
         auto seat = safe_ptr(reinterpret_cast<wl_seat*>(seat_raw), wl_seat_destroy);
         auto shell = safe_ptr(reinterpret_cast<zxdg_shell_v6*>(shell_raw), zxdg_shell_v6_destroy);
-        auto tablet = safe_ptr(reinterpret_cast<zwp_tablet_manager_v2*>(tablet_raw), zwp_tablet_manager_v2_destroy);
+        auto tablet_manager = safe_ptr(reinterpret_cast<zwp_tablet_manager_v2*>(tablet_manager_raw),
+                                       zwp_tablet_manager_v2_destroy);
 
         auto shell_binder = bind_listener<zxdg_shell_v6_listener>(
             [&](uint32_t serial) noexcept { // ping
@@ -144,10 +143,7 @@ int main() {
         auto egl_display = safe_ptr(eglGetDisplay(display.get()), eglTerminate);
         eglInitialize(egl_display.get(), nullptr, nullptr);
         eglBindAPI(EGL_OPENGL_ES_API);
-        float resolution_vec[2] = { 640, 480 };
-        auto egl_window = safe_ptr(wl_egl_window_create(surface.get(),
-                                                        resolution_vec[0],
-                                                        resolution_vec[1]),
+        auto egl_window = safe_ptr(wl_egl_window_create(surface.get(), 640, 480),
                                    wl_egl_window_destroy);
         EGLConfig config;
         EGLint num_config;
@@ -188,14 +184,28 @@ int main() {
                        egl_surface.get(), egl_surface.get(),
                        egl_context.get());
 
+        struct {
+            struct {
+                std::complex<int32_t> configuration;
+            } toplevel;
+            struct {
+                std::tuple<uint32_t, uint32_t> key;
+            } keyboard;
+            struct {
+                std::complex<double> motion;
+            } pointer;
+            struct {
+                std::array<std::complex<double>, 10> motion;
+            } touch;
+        } input;
+
         auto toplevel = safe_ptr(zxdg_surface_v6_get_toplevel(xsurface.get()), zxdg_toplevel_v6_destroy);
         auto toplevel_binder = bind_listener<zxdg_toplevel_v6_listener>(
             [&](int32_t width, int32_t height, auto) noexcept { // configure
                 if (width * height) {
                     wl_egl_window_resize(egl_window.get(), width, height, 0, 0);
                     glViewport(0, 0, width, height);
-                    resolution_vec[0] = width;
-                    resolution_vec[1] = height;
+                    input.toplevel.configuration = { width, height };
                 }
             },
             [&]() noexcept { });//close
@@ -203,31 +213,23 @@ int main() {
         wl_surface_commit(surface.get());
 
         auto keyboard = safe_ptr(wl_seat_get_keyboard(seat.get()), wl_keyboard_destroy);
-        struct {
-            uint32_t key;
-            uint32_t state;
-        } key_input;
         auto keyboard_binder = bind_listener<wl_keyboard_listener>(
             [](auto...) noexcept { }, // keymap
             [](auto...) noexcept { }, // enter
             [](auto...) noexcept { }, // leave
             [&](auto, auto, uint32_t key, uint32_t state) noexcept { // key
-                key_input = { key, state };
+                input.keyboard.key = { key, state };
             },
             [](auto...) noexcept { }, // modifier
             [](auto...) noexcept { });// repeat_info
         wl_keyboard_add_listener(keyboard.get(), &keyboard_binder.listener, &keyboard_binder.closure);
 
-        auto mouse = safe_ptr(wl_seat_get_pointer(seat.get()), wl_pointer_destroy);
-        struct {
-            double point[2];
-        } mouse_input;
-        auto mouse_binder = bind_listener<wl_pointer_listener>(
+        auto pointer = safe_ptr(wl_seat_get_pointer(seat.get()), wl_pointer_destroy);
+        auto pointer_binder = bind_listener<wl_pointer_listener>(
             [](auto...) noexcept { }, // enter
             [](auto...) noexcept { }, // leave
             [&](auto, wl_fixed_t x, wl_fixed_t y) noexcept { // motion
-                mouse_input.point[0] = static_cast<float>(wl_fixed_to_int(x));
-                mouse_input.point[1] = static_cast<float>(wl_fixed_to_int(y));
+                input.pointer.motion = { wl_fixed_to_double(x), wl_fixed_to_double(y) };
             },
             [](auto...) noexcept { }, // button
             [](auto...) noexcept { }, // axis
@@ -235,16 +237,51 @@ int main() {
             [](auto...) noexcept { }, // axis_source
             [](auto...) noexcept { }, // axis_stop
             [](auto...) noexcept { });// axis_discrete
-        wl_pointer_add_listener(mouse.get(), &mouse_binder.listener, &mouse_binder.closure);
+        wl_pointer_add_listener(pointer.get(), &pointer_binder.listener, &pointer_binder.closure);
 
-        do {
-            if (key_input.key == 1 && key_input.state == 0) {
+        auto touch = safe_ptr(wl_seat_get_touch(seat.get()), wl_touch_destroy);
+        auto touch_binder = bind_listener<wl_touch_listener>(
+            [](auto...) noexcept { }, // down
+            [](auto...) noexcept { }, // up
+            [&](auto, int32_t id, wl_fixed_t x, wl_fixed_t y) noexcept { // motion
+                input.touch.motion[id] = { wl_fixed_to_double(x), wl_fixed_to_double(y) };
+            },
+            [](auto...) noexcept { }, // frame
+            [](auto...) noexcept { }, // cancel
+            [](auto...) noexcept { }, // shape
+            [](auto...) noexcept { });// orientation
+        wl_touch_add_listener(touch.get(), &touch_binder.listener, &touch_binder.closure);
+
+        // auto tablet_seat = safe_ptr(zwp_tablet_manager_v2_get_tablet_seat(tablet_manager.get(), seat.get()),
+        //                             zwp_tablet_seat_v2_destroy);
+        // zwp_tablet_v2* tablet_raw = nullptr;
+        // zwp_tablet_tool_v2* tablet_tool_raw = nullptr;
+        // zwp_tablet_pad_v2* tablet_pad_raw = nullptr;
+        // auto tablet_seat_binder = bind_listener<zwp_tablet_seat_v2_listener>(
+        //     [&](auto tablet) noexcept { // tablet_added
+        //         tablet_raw = tablet;
+        //     },
+        //     [&](auto tablet_tool) noexcept { // tool_added
+        //         tablet_tool_raw = tablet_tool;
+        //     },
+        //     [&](auto tablet_pad) noexcept { // pad_added
+        //         tablet_pad_raw = tablet_pad;
+        //     });
+        // zwp_tablet_seat_v2_add_listener(tablet_seat.get(),
+        //                                 &tablet_seat_binder.listener,
+        //                                 &tablet_seat_binder.closure);
+        // wl_display_roundtrip(display.get());
+        // auto tablet = safe_ptr(tablet_raw, zwp_tablet_v2_destroy);
+
+        while (wl_display_dispatch(display.get()) != -1) {
+            if (input.keyboard.key == std::tuple{1, 0}) { // ESC-UP
                 break;
             }
             glClearColor(0.0, 0.0, 0.8, 0.8);
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
             eglSwapBuffers(egl_display.get(), egl_surface.get());
-        } while (wl_display_dispatch(display.get()) != -1);
+            std::cout << input.toplevel.configuration << std::endl;
+        }
     }
     catch (std::source_location& loc) {
         std::cerr << loc.file_name() << ':' << loc.line() << ": Fatal error..." << std::endl;
