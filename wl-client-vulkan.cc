@@ -30,7 +30,8 @@ inline namespace aux
         void print(std::basic_ostream<Ch>& output, Tuple const& tuple, std::index_sequence<I...>) noexcept {
             (void) std::initializer_list<int>{(output << (I == 0 ? "" : " ") << std::get<I>(tuple), 0)... };
         }
-    }
+    } // ::detail
+
     template <class Ch, class... Args>
     auto& operator<<(std::basic_ostream<Ch>& output, std::tuple<Args...> const& tuple) noexcept {
         output.put('(');
@@ -41,14 +42,12 @@ inline namespace aux
 
     template <class T, class D>
     auto safe_ptr(T* ptr, D del, std::source_location loc = std::source_location::current()) {
-        if (ptr == nullptr) {
-            throw loc;
-        }
+        if (ptr == nullptr) throw loc;
         return std::unique_ptr<T, D>(ptr, del);
     }
 } // ::aux
 
-inline namespace wayland_client_support
+inline namespace wl_client_topic_support
 {
     namespace detail
     {
@@ -61,11 +60,9 @@ inline namespace wayland_client_support
             struct {
                 WL_LISTENER listener;
                 CLOSURE_TUPLE closure;
-            } binder = {
-                .listener = {
-                    to_function<CLOSURE_TUPLE, I>...
-                },
-                .closure = closure,
+            } binder {
+                .listener { to_function<CLOSURE_TUPLE, I>... },
+                .closure { closure }
             };
             return binder;
         }
@@ -75,7 +72,7 @@ inline namespace wayland_client_support
         return detail::bind_listener<WL_LISTENER>(std::tuple(closure...),
                                                   std::make_index_sequence<sizeof... (CLOSURE)>());
     }
-} // ::wayland_client_support
+} // ::wl_client_topic_support
 
 int main() {
     try {
@@ -140,10 +137,419 @@ int main() {
             });
         zxdg_surface_v6_add_listener(xsurface.get(), &xsurface_binder.listener, &xsurface_binder.closure);
 
+        ///////////////////////////////////////////////////////
+        vk::ApplicationInfo app_info {
+            "wl-client-vulkan",
+            0,                  // VK_MAKE_VERSION(1, 0, 0),
+            nullptr,            //"No engine",
+            0,                  // VK_MAKE_VERSION(1, 0, 0),
+            VK_API_VERSION_1_3,
+        };
+        constexpr char const* layers[] {
+            "VK_LAYER_KHRONOS_validation",
+            "VK_LAYER_LUNARG_api_dump",
+        };
+        constexpr char const* extensions[] {
+            "VK_KHR_surface",
+            "VK_KHR_wayland_surface",
+            "VK_EXT_debug_report",
+            "VK_EXT_debug_utils",
+        };
+
+        vk::StructureChain<vk::InstanceCreateInfo, vk::DebugUtilsMessengerCreateInfoEXT> createInfo {
+            { {}, &app_info, layers, extensions },
+            { {},
+              vk::DebugUtilsMessageSeverityFlagsEXT {
+                  vk::DebugUtilsMessageSeverityFlagBitsEXT::eVerbose |
+                  vk::DebugUtilsMessageSeverityFlagBitsEXT::eInfo |
+                  vk::DebugUtilsMessageSeverityFlagBitsEXT::eWarning |
+                  vk::DebugUtilsMessageSeverityFlagBitsEXT::eError
+              },
+              vk::DebugUtilsMessageTypeFlagsEXT {
+                  vk::DebugUtilsMessageTypeFlagBitsEXT::eGeneral |
+                  vk::DebugUtilsMessageTypeFlagBitsEXT::eValidation |
+                  vk::DebugUtilsMessageTypeFlagBitsEXT::ePerformance |
+                  vk::DebugUtilsMessageTypeFlagBitsEXT::eDeviceAddressBinding
+              },
+              [](VkDebugUtilsMessageSeverityFlagBitsEXT severity,
+                 VkDebugUtilsMessageTypeFlagsEXT type,
+                 VkDebugUtilsMessengerCallbackDataEXT const* callback_data,
+                 void* userdata) noexcept {
+                  // std::cerr << "validation layer: " << callback_data->pMessage << std::endl;
+                  return VK_FALSE;
+              },
+            },
+        };
+        auto instance = vk::createInstanceUnique(createInfo.get<vk::InstanceCreateInfo>());
+
+        auto device = [&instance] {
+            for (auto pdev : instance->enumeratePhysicalDevices()) {
+                auto feat = pdev.getFeatures();
+                if (feat.geometryShader == VK_TRUE && feat.tessellationShader == VK_TRUE) {
+                    for (uint32_t index = 0; auto qprop : pdev.getQueueFamilyProperties()) {
+                        if (qprop.queueFlags & vk::QueueFlagBits::eGraphics &&
+                            qprop.queueFlags & vk::QueueFlagBits::eCompute &&
+                            qprop.queueFlags & vk::QueueFlagBits::eTransfer)
+                        {
+                            float queue_priorities[] = { 0.0f };
+                            vk::DeviceQueueCreateInfo info {
+                                {}, index, 1, queue_priorities,
+                            };
+                            constexpr char const* layers[] = {
+                                // "VK_LAYER_KHRONOS_validation",
+                                // "VK_LAYER_LUNARG_api_dump",
+                            };
+                            constexpr char const* extensions[] = {
+                                VK_KHR_SWAPCHAIN_EXTENSION_NAME,
+                                // VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,
+                                // VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME,
+                                // VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
+                                // VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME,
+                            };
+                            vk::PhysicalDeviceFeatures feat_null{};
+                            return pdev.createDeviceUnique(vk::DeviceCreateInfo {
+                                    {},
+                                    1,
+                                    &info,
+                                    0,
+                                    layers,
+                                    1,
+                                    extensions,
+                                    &feat_null
+                                });
+                        }
+                        ++index;
+                    }
+                }
+            }
+            throw std::source_location::current();
+        }();
+
+        auto semaphore1 = device->createSemaphoreUnique(vk::SemaphoreCreateInfo {});
+        auto semaphore2 = device->createSemaphoreUnique(vk::SemaphoreCreateInfo {});
+        auto fence1 = device->createFenceUnique(vk::FenceCreateInfo {
+                vk::FenceCreateFlagBits::eSignaled,
+            });
+        auto semaphore3 = device->createSemaphoreUnique(vk::SemaphoreCreateInfo {});
+        auto semaphore4 = device->createSemaphoreUnique(vk::SemaphoreCreateInfo {});
+        auto fence2 = device->createFenceUnique(vk::FenceCreateInfo {
+                vk::FenceCreateFlagBits::eSignaled,
+            });
+
+        auto vk_surface = instance->createWaylandSurfaceKHRUnique({
+                {},
+                display.get(),
+                surface.get(),
+                nullptr,
+            });
+
+        auto swapchain = device->createSwapchainKHRUnique({
+                {},
+                vk_surface.get(),
+                4,
+                vk::Format::eB8G8R8A8Unorm,
+                vk::ColorSpaceKHR::eSrgbNonlinear,
+                { 800, 600 },
+                1,
+                vk::ImageUsageFlagBits::eColorAttachment,
+                vk::SharingMode::eExclusive,
+                0,
+                nullptr,
+                vk::SurfaceTransformFlagBitsKHR::eIdentity,
+                vk::CompositeAlphaFlagBitsKHR::eOpaque,
+                vk::PresentModeKHR::eMailbox,
+                VK_TRUE,
+            });
+
+        auto images = device->getSwapchainImagesKHR(swapchain.get());
+        // auto get_next_image = [&] {
+        //     for (;;) {
+        //         auto ret = device->acquireNextImageKHR(swapchain.get(), 0);
+        //         if (ret.result == vk::Result::eSuccess) {
+        //             return images[ret.value];
+        //         }
+        //         else if (ret.result != vk::Result::eNotReady) {
+        //             throw std::source_location::current();
+        //         }
+        //     }
+        // };
+        // auto next_image = get_next_image();
+        // std::cout << typeid (next_image).name() << ':' << next_image << std::endl;
+
+        std::vector<decltype (device->createImageViewUnique({}))> views;
+        for (auto image : images) {
+            views.push_back(device->createImageViewUnique(vk::ImageViewCreateInfo {
+                        {},
+                        image,
+                        vk::ImageViewType::e2D,
+                        vk::Format::eB8G8R8A8Unorm,
+                        {},
+                        vk::ImageSubresourceRange {
+                            vk::ImageAspectFlagBits::eColor,
+                            0,
+                            0,
+                            0,
+                            1,
+                        },
+                        nullptr,
+                    }));
+        }
+
+        vk::AttachmentDescription attachment {
+            vk::Flags<vk::AttachmentDescriptionFlagBits> { },
+            vk::Format::eB8G8R8A8Unorm,
+            vk::SampleCountFlagBits::e1,
+            vk::AttachmentLoadOp::eClear,
+            vk::AttachmentStoreOp::eStore,
+            vk::AttachmentLoadOp::eDontCare,
+            vk::AttachmentStoreOp::eDontCare,
+            vk::ImageLayout::eUndefined,
+            vk::ImageLayout::ePresentSrcKHR,
+        };
+        vk::AttachmentReference attachment_ref {
+            0,
+            vk::ImageLayout::eColorAttachmentOptimal,
+        };
+        vk::SubpassDescription subpass {
+            vk::Flags<vk::SubpassDescriptionFlagBits> { },
+            vk::PipelineBindPoint::eGraphics,
+            nullptr,
+            attachment_ref,
+        };
+        vk::SubpassDependency dependency {
+            VK_SUBPASS_EXTERNAL,
+            0,
+            vk::PipelineStageFlagBits::eColorAttachmentOutput,
+            vk::PipelineStageFlagBits::eColorAttachmentOutput,
+            vk::AccessFlagBits::eNone,
+            vk::AccessFlagBits::eColorAttachmentRead | vk::AccessFlagBits::eColorAttachmentWrite,
+        };
+        auto renderpass = device->createRenderPassUnique(vk::RenderPassCreateInfo {
+                vk::Flags<vk::RenderPassCreateFlagBits> { },
+                attachment,
+                subpass,
+                dependency,
+                nullptr,
+            });
+
+        vk::DescriptorSetLayoutBinding bindings[] {
+            {
+                0,
+                vk::DescriptorType::eUniformBuffer,
+                1,
+                vk::ShaderStageFlagBits::eVertex,
+                nullptr,
+            },
+            {
+                1,
+                vk::DescriptorType::eCombinedImageSampler,
+                1,
+                vk::ShaderStageFlagBits::eFragment,
+                nullptr,
+            },
+        };
+        auto layout = device->createDescriptorSetLayoutUnique({
+                { },
+                static_cast<uint32_t>(std::size(bindings)),
+                std::data(bindings),
+            });
+
+        constexpr static std::string_view vertex_code = R"(
+            #version 450
+            #extension GL_ARB_separate_shader_objects : enable
+            #extension GL_NV_gpu_shader5 : enable
+
+            layout(binding = 0) uniform UniformBufferObject {
+                mat4 model;
+                mat4 view;
+                mat4 proj;
+            } ubo;
+
+            layout(location = 0) in vec4 inPosition;
+            layout(location = 1) in vec3 inColor;
+            layout(location = 2) in vec2 inTexCoord;
+
+            layout(location = 0) out vec3 fragColor;
+            layout(location = 1) out vec2 fragTexCoord;
+
+            out gl_PerVertex {
+                vec4 gl_Position;
+            };
+
+            void main() {
+                gl_Position = ubo.proj * ubo.view * ubo.model * inPosition;
+                fragColor = inColor;
+                fragTexCoord = inTexCoord;
+            }
+        )";
+        auto vertex_shader = device->createShaderModuleUnique(
+            vk::ShaderModuleCreateInfo {
+                {},
+                vertex_code.size(),
+                reinterpret_cast<uint32_t const*>(vertex_code.data()),
+            });
+
+        constexpr static std::string_view fragment_code = R"(
+            #version 450
+            #extension GL_ARB_separate_shader_objects : enable
+            #extension GL_NV_gpu_shader5 : enable
+
+            layout(location = 0) in vec3 fragColor;
+            layout(location = 1) in vec2 fragTexCoord;
+            layout(binding = 1) uniform sampler2D texSampler;
+
+            layout(location = 0) out vec4 outColor;
+
+            void main() {
+                outColor = texture(texSampler, fragTexCoord);
+            }
+        )";
+        auto fragment_shader = device->createShaderModuleUnique(
+            vk::ShaderModuleCreateInfo {
+                {},
+                fragment_code.size(),
+                reinterpret_cast<uint32_t const*>(fragment_code.data()),
+            });
+
+        vk::PipelineShaderStageCreateInfo stages[] = {
+            {
+                {},
+                vk::ShaderStageFlagBits::eVertex,
+                vertex_shader.get(),
+                "main",
+            },
+            {
+                {},
+                vk::ShaderStageFlagBits::eFragment,
+                fragment_shader.get(),
+                "main",
+            },
+        };
+
+        struct vertex {
+            float pos[4];
+            float color[3];
+            float tex_coords[2];
+        };
+
+        vk::VertexInputBindingDescription vertex_input_binding {
+            0,
+            sizeof (vertex),
+            vk::VertexInputRate::eVertex,
+        };
+        vk::VertexInputAttributeDescription attribute_descriptions[3] = {
+            {
+                0,
+                0,
+                vk::Format::eR32G32B32A32Sfloat,
+                offsetof(vertex, pos),
+            },
+            {
+                1,
+                0,
+                vk::Format::eR32G32B32Sfloat,
+                offsetof(vertex, color),
+            },
+            {
+                2,
+                0,
+                vk::Format::eR32G32Sfloat,
+                offsetof(vertex, tex_coords),
+            },
+        };
+
+        vk::PipelineVertexInputStateCreateInfo vertex_input_info {
+            {},
+            vertex_input_binding,
+            attribute_descriptions,
+        };
+
+        vk::PipelineInputAssemblyStateCreateInfo input_assembly {
+            {},
+            vk::PrimitiveTopology::eTriangleList,
+            VK_FALSE,
+        };
+
+        vk::Viewport viewport {
+            0.0f,
+            0.0f,
+            800.0f,
+            600.0f,
+            0.0f,
+            1.0f,
+        };
+        vk::Rect2D scissor {
+            { 0, 0, },
+            { 800, 600, },
+        };
+        vk::PipelineViewportStateCreateInfo viewport_state {
+            {},
+            viewport,
+            scissor,
+        };
+
+        vk::PipelineRasterizationStateCreateInfo rasterization_state {
+            {},
+            VK_FALSE,
+            VK_FALSE,
+            vk::PolygonMode::eFill,
+            vk::CullModeFlagBits::eBack,
+            vk::FrontFace::eCounterClockwise,
+            VK_FALSE,
+            0.0f,
+            0.0f,
+            0.0f,
+            1.0f,
+        };
+
+        vk::PipelineMultisampleStateCreateInfo multisample_state {
+            {},
+            vk::SampleCountFlagBits::e1,
+            VK_FALSE,
+        };
+
+        vk::PipelineColorBlendAttachmentState color_blend_attachment { };
+        color_blend_attachment.colorWriteMask =
+            vk::ColorComponentFlagBits::eR |
+            vk::ColorComponentFlagBits::eG |
+            vk::ColorComponentFlagBits::eB |
+            vk::ColorComponentFlagBits::eA;
+
+        vk::PipelineColorBlendStateCreateInfo color_blend_state { };
+        color_blend_state.logicOp = vk::LogicOp::eCopy;
+        color_blend_state.attachmentCount = 1;
+        color_blend_state.pAttachments = &color_blend_attachment;
+
+        vk::PipelineLayoutCreateInfo layout_info {
+            {},
+            layout.get(),
+        };
+        auto pipeline_layout = device->createPipelineLayoutUnique(layout_info);
+
+        vk::GraphicsPipelineCreateInfo pipeline_info {
+            {},
+            stages,
+            &vertex_input_info,
+            &input_assembly,
+            {}, // tessellation_state
+            &viewport_state,
+            &rasterization_state,
+            &multisample_state,
+            {},
+            &color_blend_state,
+            {},
+            pipeline_layout.get(),
+            renderpass.get(),
+        };
+        auto pipeline = device->createGraphicsPipelinesUnique(VK_NULL_HANDLE,
+                                                              pipeline_info);
+
+        ///////////////////////////////////////////////////////
+
         auto egl_display = safe_ptr(eglGetDisplay(display.get()), eglTerminate);
         eglInitialize(egl_display.get(), nullptr, nullptr);
         eglBindAPI(EGL_OPENGL_ES_API);
-        auto egl_window = safe_ptr(wl_egl_window_create(surface.get(), 640, 480),
+        auto egl_window = safe_ptr(wl_egl_window_create(surface.get(), 800, 600),
                                    wl_egl_window_destroy);
         EGLConfig config;
         EGLint num_config;
@@ -195,7 +601,7 @@ int main() {
                 std::complex<double> motion;
             } pointer;
             struct {
-                std::array<std::complex<double>, 10> motion;
+                std::array<std::complex<double>, 10> motions;
             } touch;
         } input;
 
@@ -244,7 +650,7 @@ int main() {
             [](auto...) noexcept { }, // down
             [](auto...) noexcept { }, // up
             [&](auto, int32_t id, wl_fixed_t x, wl_fixed_t y) noexcept { // motion
-                input.touch.motion[id] = { wl_fixed_to_double(x), wl_fixed_to_double(y) };
+                input.touch.motions[id] = { wl_fixed_to_double(x), wl_fixed_to_double(y) };
             },
             [](auto...) noexcept { }, // frame
             [](auto...) noexcept { }, // cancel
@@ -280,11 +686,15 @@ int main() {
             glClearColor(0.0, 0.0, 0.8, 0.8);
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
             eglSwapBuffers(egl_display.get(), egl_surface.get());
-            std::cout << input.toplevel.configuration << std::endl;
         }
+
+        while (vkDeviceWaitIdle(device.get()) != VK_SUCCESS) continue; // clean up wait
     }
     catch (std::source_location& loc) {
         std::cerr << loc.file_name() << ':' << loc.line() << ": Fatal error..." << std::endl;
+    }
+    catch (vk::Error& error) {
+        std::cerr << error.what() << std::endl;
     }
     std::cout << "bye." << std::endl;
     return 0;
